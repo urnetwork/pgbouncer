@@ -10,7 +10,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from .utils import USE_SUDO
+from .utils import LINUX, USE_SUDO
 
 
 @pytest.mark.parametrize(
@@ -733,6 +733,9 @@ def test_query_timeout_when_no_active_query(bouncer):
         assert result[0] == 2
 
 
+# tcp_socket_buffer pins the client sockets' receive buffer, so the FIN of a
+# client that hung up always fits behind the unread rest of its query, whatever
+# the kernel's default buffer size.
 WAITING_HANGUP_CONFIG = """
 [databases]
 postgres = host={pg_host} port={pg_port} pool_size=1
@@ -746,6 +749,7 @@ listen_port = {port}
 logfile = {log_path}
 pool_mode = transaction
 query_wait_timeout = 60
+tcp_socket_buffer = 65536
 """
 
 
@@ -790,6 +794,28 @@ def _queue_query_then_keep_socket(bouncer, query="select 1"):
                 return sock
 
 
+def _hang_up(sock):
+    """Close a queued client's socket once PgBouncer's kernel holds its FIN.
+
+    A half-close leaves FIN_WAIT1 when PgBouncer's kernel acknowledges the FIN
+    (FIN_WAIT2), or when PgBouncer has already dropped the client in reply
+    (TIME_WAIT, CLOSING or CLOSE). Either way the FIN sits in PgBouncer's
+    receive queue behind any unread rest of the query, which is what a client
+    that gave up while queued looks like, with no assumption about how long
+    delivery takes.
+    """
+    tcp_fin_wait1 = 4  # linux/tcp_states.h
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        for _ in range(200):
+            if sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 8)[0] != tcp_fin_wait1:
+                return
+            time.sleep(0.01)
+        raise AssertionError("PgBouncer's kernel did not acknowledge the client's FIN")
+    finally:
+        sock.close()
+
+
 def _wait_for_waiting_clients(bouncer, count):
     for _ in range(100):
         pools = bouncer.admin("SHOW POOLS", row_factory=dict_row)
@@ -800,6 +826,7 @@ def _wait_for_waiting_clients(bouncer, count):
     raise AssertionError(f"expected {count} waiting clients, saw {waiting}")
 
 
+@pytest.mark.skipif(not LINUX, reason="needs TCP_INFO and POLLRDHUP")
 def test_released_server_skips_waiting_client_that_hung_up(bouncer):
     """A server released to the queue must not go to a client that gave up.
 
@@ -816,22 +843,21 @@ def test_released_server_skips_waiting_client_that_hung_up(bouncer):
                 cur.execute("select pg_backend_pid()")
                 pid = cur.fetchone()[0]
                 # Larger than PgBouncer's 4 kB packet buffer, so part of it is
-                # still in the kernel, yet small enough that the client's FIN
-                # fits behind it in an 8 kB socket receive buffer.
+                # still in the kernel when the client hangs up.
                 gone = _queue_query_then_keep_socket(
                     bouncer, "select length('" + "x" * 6144 + "')"
                 )
                 _wait_for_waiting_clients(bouncer, 1)
                 live = pool.submit(bouncer.sql_value, "select pg_backend_pid()")
                 _wait_for_waiting_clients(bouncer, 2)
-                gone.close()
-                time.sleep(0.2)
+                _hang_up(gone)
             assert live.result(timeout=10) == pid
         assert bouncer.sql_value("select pg_backend_pid()") == pid
         servers = bouncer.admin("SHOW SERVERS", row_factory=dict_row)
         assert [server["database"] for server in servers] == ["postgres"]
 
 
+@pytest.mark.skipif(not LINUX, reason="needs TCP_INFO and POLLRDHUP")
 def test_resumed_pool_skips_waiting_client_that_hung_up(bouncer):
     """The janitor must not launch or hand a server to a client that gave up.
 
@@ -849,8 +875,10 @@ def test_resumed_pool_skips_waiting_client_that_hung_up(bouncer):
         try:
             gone = _queue_query_then_keep_socket(bouncer)
             _wait_for_waiting_clients(bouncer, 1)
-            gone.close()
-            time.sleep(0.2)
+            _hang_up(gone)
+            # The queue empties only after the janitor has dealt with the
+            # client: before the fix that means a server was launched for it
+            # and logged first, so the counts below hold once it is empty.
             with (
                 bouncer.log_contains(r"client hung up while waiting for a server", times=1),
                 bouncer.log_contains(r"new connection to server", times=0),
@@ -858,7 +886,6 @@ def test_resumed_pool_skips_waiting_client_that_hung_up(bouncer):
                 bouncer.admin("RESUME postgres")
                 resumed = True
                 _wait_for_waiting_clients(bouncer, 0)
-                time.sleep(0.3)
         finally:
             if not resumed:
                 bouncer.admin("RESUME postgres")
