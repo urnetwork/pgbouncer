@@ -142,6 +142,12 @@ static void per_loop_activate(PgPool *pool)
 		bool res;
 		client = container_of(item, PgSocket, head);
 
+		/* a client that gave up must not take a server or launch one */
+		if (!client->replication && waiting_client_hung_up(client)) {
+			disconnect_client(client, false, "client hung up while waiting for a server");
+			continue;
+		}
+
 		if (client->state == CL_WAITING
 		    && !client->sent_wait_notification
 		    && client->welcome_sent

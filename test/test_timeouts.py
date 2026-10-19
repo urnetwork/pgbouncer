@@ -1,11 +1,14 @@
 import asyncio
 import platform
+import socket
+import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
 import pytest
+from psycopg.rows import dict_row
 
 from .utils import USE_SUDO
 
@@ -728,3 +731,135 @@ def test_query_timeout_when_no_active_query(bouncer):
         cur.execute("SELECT 2")
         result = cur.fetchone()
         assert result[0] == 2
+
+
+WAITING_HANGUP_CONFIG = """
+[databases]
+postgres = host={pg_host} port={pg_port} pool_size=1
+
+[pgbouncer]
+listen_addr = {host}
+admin_users = pgbouncer
+auth_type = trust
+auth_file = {auth_path}
+listen_port = {port}
+logfile = {log_path}
+pool_mode = transaction
+query_wait_timeout = 60
+"""
+
+
+def _waiting_hangup_config(bouncer):
+    return WAITING_HANGUP_CONFIG.format(
+        pg_host=bouncer.pg.host,
+        pg_port=bouncer.pg.port,
+        host=bouncer.host,
+        auth_path=bouncer.auth_path,
+        port=bouncer.port,
+        log_path=bouncer.log_path,
+    )
+
+
+def _queue_query_then_keep_socket(bouncer, query="select 1"):
+    """Log in over a raw socket and send a query without reading its result.
+
+    The caller closes the socket to act like a client whose own deadline
+    expired while PgBouncer still had it queued. A query larger than PgBouncer's
+    packet buffer leaves the rest of itself in the kernel when the client is
+    paused, which is how production clients lost servers: on activation
+    PgBouncer read and forwarded that rest before it read the EOF.
+    """
+    sock = socket.create_connection((bouncer.host, bouncer.port), timeout=10)
+    params = b"user\0puser1\0database\0postgres\0\0"
+    sock.sendall(struct.pack("!ii", 8 + len(params), 196608) + params)
+    received = b""
+    while True:
+        chunk = sock.recv(8192)
+        assert chunk, "PgBouncer closed the login"
+        received += chunk
+        while len(received) >= 5:
+            kind = received[:1]
+            length = struct.unpack("!i", received[1:5])[0]
+            if len(received) < 1 + length:
+                break
+            assert kind != b"E", received
+            received = received[1 + length :]
+            if kind == b"Z":
+                payload = query.encode() + b"\0"
+                sock.sendall(b"Q" + struct.pack("!i", 4 + len(payload)) + payload)
+                return sock
+
+
+def _wait_for_waiting_clients(bouncer, count):
+    for _ in range(100):
+        pools = bouncer.admin("SHOW POOLS", row_factory=dict_row)
+        waiting = sum(pool["cl_waiting"] for pool in pools if pool["database"] == "postgres")
+        if waiting == count:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"expected {count} waiting clients, saw {waiting}")
+
+
+def test_released_server_skips_waiting_client_that_hung_up(bouncer):
+    """A server released to the queue must not go to a client that gave up.
+
+    Before the fix PgBouncer activated the oldest waiting client, forwarded the
+    part of its query still in the kernel to the server, then read its EOF and
+    closed that server mid-message. A live client queued behind it must get the
+    same server.
+    """
+    bouncer.default_db = "postgres"
+    bouncer.default_user = "puser1"
+    with bouncer.run_with_config(_waiting_hangup_config(bouncer)):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with bouncer.transaction() as cur:
+                cur.execute("select pg_backend_pid()")
+                pid = cur.fetchone()[0]
+                # Larger than PgBouncer's 4 kB packet buffer, so part of it is
+                # still in the kernel, yet small enough that the client's FIN
+                # fits behind it in an 8 kB socket receive buffer.
+                gone = _queue_query_then_keep_socket(
+                    bouncer, "select length('" + "x" * 6144 + "')"
+                )
+                _wait_for_waiting_clients(bouncer, 1)
+                live = pool.submit(bouncer.sql_value, "select pg_backend_pid()")
+                _wait_for_waiting_clients(bouncer, 2)
+                gone.close()
+                time.sleep(0.2)
+            assert live.result(timeout=10) == pid
+        assert bouncer.sql_value("select pg_backend_pid()") == pid
+        servers = bouncer.admin("SHOW SERVERS", row_factory=dict_row)
+        assert [server["database"] for server in servers] == ["postgres"]
+
+
+def test_resumed_pool_skips_waiting_client_that_hung_up(bouncer):
+    """The janitor must not launch or hand a server to a client that gave up.
+
+    PAUSE closes the pool's servers, so a query sent while paused waits. On
+    RESUME the janitor walks the queue; before the fix it launched a server for
+    a client that had already hung up, handed it the abandoned query and then
+    closed it on that client's EOF.
+    """
+    bouncer.default_db = "postgres"
+    bouncer.default_user = "puser1"
+    with bouncer.run_with_config(_waiting_hangup_config(bouncer)):
+        bouncer.test()
+        bouncer.admin("PAUSE postgres")
+        resumed = False
+        try:
+            gone = _queue_query_then_keep_socket(bouncer)
+            _wait_for_waiting_clients(bouncer, 1)
+            gone.close()
+            time.sleep(0.2)
+            with (
+                bouncer.log_contains(r"client hung up while waiting for a server", times=1),
+                bouncer.log_contains(r"new connection to server", times=0),
+            ):
+                bouncer.admin("RESUME postgres")
+                resumed = True
+                _wait_for_waiting_clients(bouncer, 0)
+                time.sleep(0.3)
+        finally:
+            if not resumed:
+                bouncer.admin("RESUME postgres")
+        bouncer.test()

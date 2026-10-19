@@ -990,6 +990,74 @@ bool find_server(PgSocket *client)
 	return res;
 }
 
+/*
+ * glibc declares POLLRDHUP only under _GNU_SOURCE, which PgBouncer does not
+ * define, so supply the Linux value: 0x2000 everywhere but sparc.
+ */
+#if defined(__linux__) && !defined(POLLRDHUP)
+#if defined(__sparc__)
+#define POLLRDHUP 0x800
+#else
+#define POLLRDHUP 0x2000
+#endif
+#endif
+
+/*
+ * A waiting client is paused: its socket is not read until it gets a server.
+ * A client that gave up while waiting has usually closed its socket already,
+ * and activating it forwards the request it left behind to the new server
+ * before the read loop finds the EOF, which then closes that server. If
+ * clients give up sooner than query_wait_timeout, a starved pool loses every
+ * server it logs in this way and never refills.
+ *
+ * Look at the socket without reading from it: a hangup or a socket error means
+ * the client is gone, while pending data alone means it is still there, and
+ * that data stays queued for it. A client's FIN can only arrive once the rest
+ * of its request fits in the socket receive buffer, so a client that gave up
+ * on a larger request is still found only when it is read; a query_wait_timeout
+ * below the clients' own deadline covers that case.
+ */
+bool waiting_client_hung_up(PgSocket *client)
+{
+#ifdef WIN32
+	return false;
+#else
+	struct pollfd pfd;
+	char byte;
+	ssize_t len;
+	int res;
+
+	if (!client->sbuf.sock)
+		return false;
+
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.fd = client->sbuf.sock;
+	pfd.events = POLLIN;
+#ifdef POLLRDHUP
+	pfd.events |= POLLRDHUP;
+#endif
+	res = poll(&pfd, 1, 0);
+	if (res <= 0)
+		return false;
+	if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
+		return true;
+#ifdef POLLRDHUP
+	if (pfd.revents & POLLRDHUP)
+		return true;
+#endif
+	if (!(pfd.revents & POLLIN))
+		return false;
+
+	/* without POLLRDHUP, a readable socket with nothing to read is at EOF */
+	len = recv(pfd.fd, &byte, 1, MSG_PEEK);
+	if (len == 0)
+		return true;
+	if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+		return true;
+	return false;
+#endif
+}
+
 /* pick waiting client */
 static bool reuse_on_release(PgSocket *server)
 {
@@ -998,7 +1066,13 @@ static bool reuse_on_release(PgSocket *server)
 	PgSocket *client;
 	Assert(!server->replication);
 	slog_debug(server, "reuse_on_release: replication %d", server->replication);
-	client = first_socket(&pool->waiting_client_list);
+	while ((client = first_socket(&pool->waiting_client_list)) != NULL) {
+		if (client->replication && !sending_auth_query(client))
+			break;
+		if (!waiting_client_hung_up(client))
+			break;
+		disconnect_client(client, false, "client hung up while waiting for a server");
+	}
 	if (client && (!client->replication || sending_auth_query(client))) {
 		activate_client(client);
 
